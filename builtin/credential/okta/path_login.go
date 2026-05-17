@@ -96,7 +96,7 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, d *framew
 
 	defer b.verifyCache.Delete(nonce)
 
-	policies, resp, groupNames, err := b.Login(ctx, req, username, password, totp, nonce, preferredProvider)
+	policies, resp, groupNames, canonicalUsername, err := b.Login(ctx, req, username, password, totp, nonce, preferredProvider)
 	// Handle an internal error
 	if err != nil {
 		return nil, err
@@ -115,17 +115,26 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, d *framew
 		return nil, err
 	}
 
+	// canonicalUsername is the Okta-side canonical login (the user's profile
+	// `login` attribute), which is stable regardless of the case the user
+	// submitted in the request URL. Using it as the entity alias prevents
+	// two case-variant logins for the same Okta user from minting two
+	// separate Vault entity aliases — see the Login() doc comment.
+	if canonicalUsername == "" {
+		canonicalUsername = username
+	}
+
 	auth := &logical.Auth{
 		Metadata: map[string]string{
-			"username": username,
+			"username": canonicalUsername,
 			"policies": strings.Join(policies, ","),
 		},
 		InternalData: map[string]interface{}{
 			"password": password,
 		},
-		DisplayName: username,
+		DisplayName: canonicalUsername,
 		Alias: &logical.Alias{
-			Name: username,
+			Name: canonicalUsername,
 		},
 	}
 	cfg.PopulateTokenAuth(auth)
@@ -165,7 +174,7 @@ func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, d *f
 
 	// No TOTP entry is possible on renew. If push MFA is enabled it will still be triggered, however.
 	// Sending "" as the totp will prompt the push action if it is configured.
-	loginPolicies, resp, groupNames, err := b.Login(ctx, req, username, password, "", nonce, "")
+	loginPolicies, resp, groupNames, _, err := b.Login(ctx, req, username, password, "", nonce, "")
 	if err != nil || (resp != nil && resp.IsError()) {
 		return resp, err
 	}

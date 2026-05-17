@@ -69,29 +69,44 @@ type backend struct {
 	verifyCache *cache.Cache
 }
 
-func (b *backend) Login(ctx context.Context, req *logical.Request, username, password, totp, nonce, preferredProvider string) ([]string, *logical.Response, []string, error) {
+// Login authenticates the user against Okta. It returns the policies that
+// apply to the user, an Okta-side response object, the user's group names,
+// the canonical username Okta resolved the login to, and an error.
+//
+// The canonical username comes from the Okta user profile's `login`
+// attribute. Returning it lets the caller set the entity alias to a stable
+// value rather than the user-submitted username. This matters when Vault
+// is running in case-sensitive identity mode: Okta resolves logins
+// case-insensitively, so `Alice@example.com` and `alice@example.com` are
+// the same user on the Okta side, but Vault would otherwise mint two
+// separate entity aliases for them — bypassing per-entity MFA enforcement.
+// Mirrors the fix shipped for the LDAP backend in commit e2273dbd77
+// ("auth/ldap: ensure consistent entity aliasing when set from the
+// username").
+func (b *backend) Login(ctx context.Context, req *logical.Request, username, password, totp, nonce, preferredProvider string) ([]string, *logical.Response, []string, string, error) {
+	canonicalUsername := username
 	cfg, err := b.Config(ctx, req.Storage)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 	if cfg == nil {
-		return nil, logical.ErrorResponse("Okta auth method not configured"), nil, nil
+		return nil, logical.ErrorResponse("Okta auth method not configured"), nil, "", nil
 	}
 
 	// Check for a CIDR match.
 	if len(cfg.TokenBoundCIDRs) > 0 {
 		if req.Connection == nil {
 			b.Logger().Warn("token bound CIDRs found but no connection information available for validation")
-			return nil, nil, nil, logical.ErrPermissionDenied
+			return nil, nil, nil, "", logical.ErrPermissionDenied
 		}
 		if !cidrutil.RemoteAddrIsOk(req.Connection.RemoteAddr, cfg.TokenBoundCIDRs) {
-			return nil, nil, nil, logical.ErrPermissionDenied
+			return nil, nil, nil, "", logical.ErrPermissionDenied
 		}
 	}
 
 	shim, err := cfg.OktaClient(ctx)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 
 	type mfaFactor struct {
@@ -124,16 +139,16 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 		"password": password,
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, "", err
 	}
 
 	var result authResult
 	rsp, err := shim.Do(authReq, &result)
 	if err != nil {
-		return nil, logical.ErrorResponse(fmt.Sprintf("Okta auth failed: %v", err)), nil, nil
+		return nil, logical.ErrorResponse(fmt.Sprintf("Okta auth failed: %v", err)), nil, "", nil
 	}
 	if rsp == nil {
-		return nil, logical.ErrorResponse("okta auth method unexpected failure"), nil, nil
+		return nil, logical.ErrorResponse("okta auth method unexpected failure"), nil, "", nil
 	}
 
 	oktaResponse := &logical.Response{
@@ -151,13 +166,13 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 		if b.Logger().IsDebug() {
 			b.Logger().Debug("user is locked out", "user", username)
 		}
-		return nil, logical.ErrorResponse("okta authentication failed"), nil, nil
+		return nil, logical.ErrorResponse("okta authentication failed"), nil, "", nil
 
 	case "PASSWORD_EXPIRED":
 		if b.Logger().IsDebug() {
 			b.Logger().Debug("password is expired", "user", username)
 		}
-		return nil, logical.ErrorResponse("okta authentication failed"), nil, nil
+		return nil, logical.ErrorResponse("okta authentication failed"), nil, "", nil
 
 	case "PASSWORD_WARN":
 		oktaResponse.AddWarning("Your Okta password is in warning state and needs to be changed soon.")
@@ -167,7 +182,7 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 			if b.Logger().IsDebug() {
 				b.Logger().Debug("user must enroll or complete mfa enrollment", "user", username)
 			}
-			return nil, logical.ErrorResponse("okta authentication failed: you must complete MFA enrollment to continue"), nil, nil
+			return nil, logical.ErrorResponse("okta authentication failed: you must complete MFA enrollment to continue"), nil, "", nil
 		}
 
 	case "MFA_REQUIRED":
@@ -214,9 +229,9 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 		case pushFactor != nil && pushFactor.Provider == oktaProvider:
 			selectedFactor = pushFactor
 		case totpFactor != nil && totp == "":
-			return nil, logical.ErrorResponse("'totp' passcode parameter is required to perform MFA"), nil, nil
+			return nil, logical.ErrorResponse("'totp' passcode parameter is required to perform MFA"), nil, "", nil
 		default:
-			return nil, logical.ErrorResponse("Okta Verify Push or TOTP or Google TOTP factor is required in order to perform MFA"), nil, nil
+			return nil, logical.ErrorResponse("Okta Verify Push or TOTP or Google TOTP factor is required in order to perform MFA"), nil, "", nil
 		}
 
 		requestPath := fmt.Sprintf("authn/factors/%s/verify", selectedFactor.Id)
@@ -230,7 +245,7 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 
 		verifyReq, err := shim.NewRequest("POST", requestPath, payload)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, "", err
 		}
 		if len(req.Headers["X-Forwarded-For"]) > 0 {
 			verifyReq.Header.Set("X-Forwarded-For", req.Headers[textproto.CanonicalMIMEHeaderKey("X-Forwarded-For")][0])
@@ -238,17 +253,17 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 
 		rsp, err := shim.Do(verifyReq, &result)
 		if err != nil {
-			return nil, logical.ErrorResponse(fmt.Sprintf("Okta auth failed: %v", err)), nil, nil
+			return nil, logical.ErrorResponse(fmt.Sprintf("Okta auth failed: %v", err)), nil, "", nil
 		}
 		if rsp == nil {
-			return nil, logical.ErrorResponse("okta auth backend unexpected failure"), nil, nil
+			return nil, logical.ErrorResponse("okta auth backend unexpected failure"), nil, "", nil
 		}
 		for result.Status == "MFA_CHALLENGE" {
 			switch result.FactorResult {
 			case "WAITING":
 				verifyReq, err := shim.NewRequest("POST", requestPath, payload)
 				if err != nil {
-					return nil, logical.ErrorResponse(fmt.Sprintf("okta auth failed creating verify request: %v", err)), nil, nil
+					return nil, logical.ErrorResponse(fmt.Sprintf("okta auth failed creating verify request: %v", err)), nil, "", nil
 				}
 				rsp, err := shim.Do(verifyReq, &result)
 
@@ -256,17 +271,17 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 				numberChallenge := result.Embedded.Factor.Embedded.Challenge.CorrectAnswer
 				if numberChallenge != nil {
 					if nonce == "" {
-						return nil, logical.ErrorResponse("nonce must be provided during login request when presented with number challenge"), nil, nil
+						return nil, logical.ErrorResponse("nonce must be provided during login request when presented with number challenge"), nil, "", nil
 					}
 
 					b.verifyCache.SetDefault(nonce, *numberChallenge)
 				}
 
 				if err != nil {
-					return nil, logical.ErrorResponse(fmt.Sprintf("Okta auth failed checking loop: %v", err)), nil, nil
+					return nil, logical.ErrorResponse(fmt.Sprintf("Okta auth failed checking loop: %v", err)), nil, "", nil
 				}
 				if rsp == nil {
-					return nil, logical.ErrorResponse("okta auth backend unexpected failure"), nil, nil
+					return nil, logical.ErrorResponse("okta auth backend unexpected failure"), nil, "", nil
 				}
 
 				timer := time.NewTimer(1 * time.Second)
@@ -275,19 +290,19 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 					// Continue
 				case <-ctx.Done():
 					timer.Stop()
-					return nil, logical.ErrorResponse("exiting pending mfa challenge"), nil, nil
+					return nil, logical.ErrorResponse("exiting pending mfa challenge"), nil, "", nil
 				}
 			case "REJECTED":
-				return nil, logical.ErrorResponse("multi-factor authentication denied"), nil, nil
+				return nil, logical.ErrorResponse("multi-factor authentication denied"), nil, "", nil
 			case "TIMEOUT":
-				return nil, logical.ErrorResponse("failed to complete multi-factor authentication"), nil, nil
+				return nil, logical.ErrorResponse("failed to complete multi-factor authentication"), nil, "", nil
 			case "SUCCESS":
 				// Allowed
 			default:
 				if b.Logger().IsDebug() {
 					b.Logger().Debug("unhandled result status", "status", result.Status, "factorstatus", result.FactorResult)
 				}
-				return nil, logical.ErrorResponse("okta authentication failed"), nil, nil
+				return nil, logical.ErrorResponse("okta authentication failed"), nil, "", nil
 			}
 		}
 
@@ -298,7 +313,7 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 		if b.Logger().IsDebug() {
 			b.Logger().Debug("unhandled result status", "status", result.Status)
 		}
-		return nil, logical.ErrorResponse("okta authentication failed"), nil, nil
+		return nil, logical.ErrorResponse("okta authentication failed"), nil, "", nil
 	}
 
 	// Verify result status again in case a switch case above modifies result
@@ -313,7 +328,16 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 		if b.Logger().IsDebug() {
 			b.Logger().Debug("authentication returned a non-success status", "status", result.Status)
 		}
-		return nil, logical.ErrorResponse("okta authentication failed"), nil, nil
+		return nil, logical.ErrorResponse("okta authentication failed"), nil, "", nil
+	}
+
+	// Pull the canonical login from the Okta-side user profile if the auth
+	// response carried one. Falling back to the submitted username keeps the
+	// previous behavior for old Okta deployments that don't return a profile.
+	if profile := result.Embedded.User.Profile; profile != nil {
+		if login := profile.GetLogin(); login != "" {
+			canonicalUsername = login
+		}
 	}
 
 	var allGroups []string
@@ -322,7 +346,7 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 	if client != nil {
 		oktaGroups, err := b.getOktaGroups(oktactx, client, &result.Embedded.User)
 		if err != nil {
-			return nil, logical.ErrorResponse(fmt.Sprintf("okta failure retrieving groups: %v", err)), nil, nil
+			return nil, logical.ErrorResponse(fmt.Sprintf("okta failure retrieving groups: %v", err)), nil, "", nil
 		}
 		if len(oktaGroups) == 0 {
 			errString := fmt.Sprintf(
@@ -365,7 +389,7 @@ func (b *backend) Login(ctx context.Context, req *logical.Request, username, pas
 		policies = append(policies, user.Policies...)
 	}
 
-	return policies, oktaResponse, allGroups, nil
+	return policies, oktaResponse, allGroups, canonicalUsername, nil
 }
 
 func (b *backend) getOktaGroups(ctx context.Context, client *okta.APIClient, user *okta.User) ([]string, error) {
