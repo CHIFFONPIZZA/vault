@@ -94,6 +94,19 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, d *framew
 		return logical.ErrorResponse(fmt.Sprintf("provider %s is not among the supported ones %v", preferredProvider, b.getSupportedProviders())), nil
 	}
 
+	// Defense-in-depth: refuse to forward an empty password to Okta's
+	// /api/v1/authn endpoint. Matches the LDAP fix in commit 0699b2150e
+	// ("Disallow logins with empty passwords in LDAP Auth") and the
+	// existing checks in builtin/credential/userpass (path_login.go:82)
+	// and builtin/credential/radius (path_login.go:104). Without this,
+	// an Okta org that has enabled the passwordless-login feature could
+	// initiate a magic-link / email-OTP flow through Vault when the
+	// attacker only has the username; even in standard password-auth
+	// orgs, an empty password should never reach the upstream provider.
+	if password == "" {
+		return logical.ErrorResponse("missing password"), nil
+	}
+
 	defer b.verifyCache.Delete(nonce)
 
 	policies, resp, groupNames, canonicalUsername, err := b.Login(ctx, req, username, password, totp, nonce, preferredProvider)
